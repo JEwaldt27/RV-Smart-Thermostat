@@ -1,17 +1,14 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WiFiManager.h>          // WiFi config portal
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include "DHT.h"
 
-// ===== WiFi settings =====
-const char* ssid     = "YourMom";
-const char* password = "12345678";
-
 // ===== DHT settings =====
 #define DHTPIN 4
 #define DHTTYPE DHT22
-DHT dht(DHTPIN, DHTTYPE);
+DHT d(DHTPIN, DHTTYPE);
 
 // ===== LCD settings =====
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // change to 0x3F if needed
@@ -42,9 +39,12 @@ unsigned long lastReadMs      = 0;
 const unsigned long readEvery = 2000; // ms
 
 // IP display state
-bool showIP       = true;
+bool showIP       = false;
 unsigned long ipShowEnd = 0;
 String ipStr;
+
+// Backlight state
+bool backlightOn = true;
 
 // ===== Helpers =====
 String heaterStatusText() {
@@ -60,6 +60,10 @@ String modeText() {
   }
 }
 
+String backlightText() {
+  return backlightOn ? "On" : "Off";
+}
+
 // ===== Web handlers =====
 void handleRoot() {
   String page =
@@ -69,11 +73,17 @@ void handleRoot() {
     "<meta http-equiv='refresh' content='5'>"
     "<title>Smart Thermostat</title>"
     "<style>"
-    "body{font-family:Arial;text-align:center;padding-top:40px;}"
-    "h1{margin-bottom:5px;}"
-    "p{font-size:1.1rem;}"
+    "body{font-family:Arial;text-align:center;padding-top:40px;background:#f5f5f5;margin:0;}"
+    "h1{margin-bottom:5px;color:#333;}"
+    "p{font-size:1.1rem;color:#444;}"
+    "hr{margin:20px auto;width:80%;}"
+    "form{margin:10px 0;}"
     "input{font-size:1rem;padding:4px;margin-top:8px;}"
-    "button{font-size:1rem;padding:4px 10px;margin:4px;}"
+    "button{font-size:1rem;padding:4px 10px;margin:4px;border:none;border-radius:4px;"
+    "background:#3498db;color:white;cursor:pointer;}"
+    "button:hover{background:#2980b9;}"
+    ".danger{background:#e74c3c;}"
+    ".danger:hover{background:#c0392b;}"
     "</style>"
     "</head><body>"
     "<h1>Smart Thermostat</h1>"
@@ -82,6 +92,7 @@ void handleRoot() {
     "<p><b>Setpoint:</b> " + String(setPointF, 1) + " &deg;F</p>"
     "<p><b>Heater:</b> " + heaterStatusText() + "</p>"
     "<p><b>Mode:</b> " + modeText() + "</p>"
+    "<p><b>Screen:</b> " + backlightText() + "</p>"
     "<hr>"
     "<form action=\"/set\" method=\"GET\">"
       "<label>New setpoint (&deg;F): </label>"
@@ -95,9 +106,21 @@ void handleRoot() {
       "<button type=\"submit\" name=\"m\" value=\"on\">Force ON</button>"
       "<button type=\"submit\" name=\"m\" value=\"off\">Force OFF</button>"
     "</form>"
-    "<p style='margin-top:20px;font-size:0.9rem;color:#555;'>"
-    "Auto: heater ON at (SP-3&deg;F), OFF at (SP+3&deg;F). "
-    "Force ON/OFF ignore temperature."
+    "<hr>"
+    "<p><b>Display</b></p>"
+    "<form action=\"/screen\" method=\"GET\">"
+      "<button type=\"submit\" name=\"s\" value=\"on\">Screen ON</button>"
+      "<button type=\"submit\" name=\"s\" value=\"off\">Screen OFF</button>"
+    "</form>"
+    "<hr>"
+    "<p><b>System</b></p>"
+    "<button class=\"danger\" type=\"button\" "
+      "onclick=\"if(confirm('Factory reset WiFi settings? You will need to reconfigure the thermostat.'))"
+      "{ window.location.href='/resetwifi'; }\">"
+      "Factory Reset WiFi"
+    "</button>"
+    "<p style='margin-top:20px;font-size:0.9rem;color:#666;'>"
+    "Auto: heater ON at (SP-3&deg;F), OFF at (SP+3&deg;F). Force ON/OFF ignore temperature."
     "</p>"
     "</body></html>";
 
@@ -130,6 +153,33 @@ void handleMode() {
   server.send(302, "text/plain", "");
 }
 
+void handleScreen() {
+  if (server.hasArg("s")) {
+    String s = server.arg("s");
+    if (s == "on") {
+      backlightOn = true;
+      lcd.backlight();
+    } else if (s == "off") {
+      backlightOn = false;
+      lcd.noBacklight();
+    }
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleResetWiFi() {
+  server.send(200, "text/html",
+    "<html><body><h3>Resetting WiFi settings...</h3>"
+    "<p>Device will reboot into setup mode.</p></body></html>");
+
+  delay(1000);
+  WiFiManager wm;
+  wm.resetSettings();    // clear stored WiFi credentials
+  delay(500);
+  ESP.restart();
+}
+
 // ===== Control & I/O =====
 void updateHeaterControl() {
   if (controlMode == MODE_FORCE_ON) {
@@ -148,7 +198,6 @@ void updateHeaterControl() {
       }
     }
   }
-
   // Active LOW relay: LOW = ON, HIGH = OFF
   digitalWrite(RELAY_PIN, heaterOn ? LOW : HIGH);
 }
@@ -159,62 +208,76 @@ void showIPScreen() {
   lcd.setCursor(0, 0);
   lcd.print("IP Address:");
   lcd.setCursor(0, 1);
-  lcd.print(ipStr); // may truncate, that's fine
+  lcd.print(ipStr); // may truncate
 }
 
 void updateLCD() {
   lcd.clear();
 
-  // Line 0: "Set Temp: {set_temp}"
+  // Line 0: "Set Temp: {set}F"
   lcd.setCursor(0, 0);
-  lcd.print("Set Temp:");
-  lcd.setCursor(10, 0);
-  lcd.print(setPointF, 0); // no units to save space
+  lcd.print("Set Temp: ");
+  lcd.print((int)setPointF);
+  lcd.print("F");
 
-  // Line 1: "Current Temp: {temp}"
+  // Line 1: "Cur Temp: {cur}F"
   lcd.setCursor(0, 1);
-  lcd.print("Current Temp:");
-  // 13 chars used, put value at col 13
-  lcd.setCursor(13, 1);
-  lcd.print(temperatureF, 0);
+  lcd.print("Cur Temp: ");
+  lcd.print((int)temperatureF);
+  lcd.print("F");
 }
 
 void setup() {
   // LCD
   lcd.init();
   lcd.backlight();
+  backlightOn = true;
+
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Thermostat");
 
   // DHT
-  dht.begin();
+  d.begin();
 
   // Relay pin
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // OFF (active LOW)
 
-  // WiFi
+  // WiFi via WiFiManager
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFiManager wm;
 
+  // On-screen hint during setup portal
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Setup Mode");
   lcd.setCursor(0, 1);
-  lcd.print("WiFi...");
+  lcd.print("Join Therm-Setup");
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  bool res = wm.autoConnect("Therm-Setup"); // AP name
+
+  if (!res) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi failed");
+    delay(3000);
+    ESP.restart();
   }
 
+  // Connected
   ipStr = WiFi.localIP().toString();
   ipShowEnd = millis() + 30000; // 30 seconds
   showIP = true;
 
   showIPScreen();
 
-  // Web server
+  // Web server routes
   server.on("/", handleRoot);
   server.on("/set", handleSet);
   server.on("/mode", handleMode);
+  server.on("/screen", handleScreen);
+  server.on("/resetwifi", handleResetWiFi);
   server.begin();
 }
 
@@ -225,8 +288,8 @@ void loop() {
   if (now - lastReadMs >= readEvery) {
     lastReadMs = now;
 
-    float tF = dht.readTemperature(true); // Fahrenheit
-    float h  = dht.readHumidity();
+    float tF = d.readTemperature(true); // Fahrenheit
+    float h  = d.readHumidity();
 
     if (!isnan(tF) && !isnan(h)) {
       temperatureF = tF;
@@ -243,6 +306,6 @@ void loop() {
     if (!showIP) {
       updateLCD();
     }
-    // If showIP == true, we keep the IP screen as-is
+    // backlight state is handled only by /screen
   }
 }
